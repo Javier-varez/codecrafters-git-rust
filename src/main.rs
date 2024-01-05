@@ -315,6 +315,7 @@ fn write_tree_object(directory: &Path) -> anyhow::Result<GitSha1> {
         };
         tree.0.push(GitTreeEntry { name, mode, sha1 });
     }
+    tree.0.sort_by(|left, right| left.name.cmp(&right.name));
 
     // Actually write the tree
     let root = find_git_root()?;
