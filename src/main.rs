@@ -3,7 +3,7 @@ use sha1::Digest;
 
 use std::env;
 use std::fs;
-use std::os::unix::prelude::MetadataExt;
+use std::os::linux::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -307,7 +307,7 @@ fn write_tree_object(directory: &Path) -> anyhow::Result<GitSha1> {
         if name == ".git" {
             continue;
         }
-        let mode = meta.mode();
+        let mode = meta.st_mode();
         let sha1 = if meta.is_dir() {
             write_tree_object(&entry.path())?
         } else {
