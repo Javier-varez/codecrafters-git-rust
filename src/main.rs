@@ -72,14 +72,71 @@ impl TryFrom<String> for GitSha1 {
     }
 }
 
+#[derive(Debug, Clone)]
 struct GitBlob(Vec<u8>);
 
+#[derive(Debug, Clone)]
+struct GitTreeEntry {
+    mode: u16,
+    name: String,
+    sha1: GitSha1,
+}
+
+#[derive(Debug, Clone)]
+struct GitTree(Vec<GitTreeEntry>);
+
+#[derive(Debug, Clone)]
 enum GitObject {
     Blob(GitBlob),
+    Tree(GitTree),
 }
 
 fn parse_blob_object(data: &[u8]) -> anyhow::Result<GitObject> {
     Ok(GitObject::Blob(GitBlob(data.to_vec())))
+}
+
+trait MyIter: Iterator<Item = u8> + Clone {}
+
+fn parse_tree_object(data: &[u8]) -> anyhow::Result<GitObject> {
+    let mut entries = vec![];
+    let mut offset = 0;
+
+    loop {
+        if offset >= data.len() {
+            break;
+        }
+
+        let mode: Vec<u8> = data
+            .iter()
+            .cloned()
+            .skip(offset)
+            .take_while(|b| *b != b' ')
+            .collect();
+        offset += mode.len() + 1;
+        let mode = u16::from_str_radix(std::str::from_utf8(&mode)?, 8)?;
+
+        let name: Vec<u8> = data
+            .iter()
+            .cloned()
+            .skip(offset)
+            .take_while(|b| *b != 0)
+            .collect();
+        let name = std::str::from_utf8(&name)?.to_string();
+        offset += name.bytes().count() + 1;
+
+        const HASH_LEN: usize = 20;
+        let hash: Vec<u8> = data.iter().cloned().skip(offset).take(HASH_LEN).collect();
+        let hash: GitSha1 = hex::encode(hash).try_into()?;
+
+        offset += HASH_LEN;
+        entries.push(GitTreeEntry {
+            name,
+            sha1: hash,
+            mode,
+        });
+    }
+
+    Ok(GitObject::Tree(GitTree(entries)))
 }
 
 fn parse_object(data: &[u8]) -> anyhow::Result<GitObject> {
@@ -101,8 +158,8 @@ fn parse_object(data: &[u8]) -> anyhow::Result<GitObject> {
 
     match ty {
         "blob" => parse_blob_object(contents),
+        "tree" => parse_tree_object(contents),
         "commit" => unimplemented!(),
-        "tree" => unimplemented!(),
         t => Err(anyhow!("Invalid git object type found: {t}")),
     }
 }
@@ -134,7 +191,7 @@ fn init_dir() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Prints the contents of a git blob
+/// Prints the contents of a git object
 fn cat_file(args: &[String]) -> anyhow::Result<()> {
     // let pretty_print = args.iter().find(|a| *a == "-p").is_some();
 
@@ -154,6 +211,46 @@ fn cat_file(args: &[String]) -> anyhow::Result<()> {
     match object {
         GitObject::Blob(blob) => {
             print!("{}", std::str::from_utf8(&blob.0)?);
+        }
+        GitObject::Tree(tree) => {
+            for entry in &tree.0 {
+                println!("{}", entry.name);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Prints the contents of a tree
+fn ls_tree(args: &[String]) -> anyhow::Result<()> {
+    let name_only = args.iter().find(|a| *a == "--name-only").is_some();
+
+    let object_sha: GitSha1 = args
+        .iter()
+        .skip_while(|arg| arg.starts_with("-"))
+        .next()
+        .ok_or(anyhow!("cat-file requires argument \"<obj-hash>\""))
+        .and_then(|string| {
+            let s: &str = &string;
+            s.try_into()
+        })?;
+
+    let root = find_git_root()?;
+
+    let object = read_object(&root, &object_sha)?;
+    match object {
+        GitObject::Tree(tree) => {
+            if name_only {
+                for entry in &tree.0 {
+                    println!("{}", entry.name);
+                }
+            } else {
+                println!("{tree:?}");
+            }
+        }
+        _ => {
+            bail!("Object is not a tree");
         }
     }
 
@@ -213,6 +310,8 @@ fn main() -> anyhow::Result<()> {
         cat_file(&args[2..])?
     } else if args[1] == "hash-object" {
         hash_object(&args[2..])?
+    } else if args[1] == "ls-tree" {
+        ls_tree(&args[2..])?
     } else {
         println!("unknown command: {}", args[1])
     };
