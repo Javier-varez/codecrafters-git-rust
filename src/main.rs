@@ -304,6 +304,9 @@ fn write_tree_object(directory: &Path) -> anyhow::Result<GitSha1> {
             .file_name()
             .into_string()
             .map_err(|_| anyhow!("Invalid file name!"))?;
+        if name == ".git" {
+            continue;
+        }
         let mode = meta.mode();
         let sha1 = if meta.is_dir() {
             write_tree_object(&entry.path())?
