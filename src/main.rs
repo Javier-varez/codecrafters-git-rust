@@ -307,11 +307,9 @@ fn write_tree_object(directory: &Path) -> anyhow::Result<GitSha1> {
         if name == ".git" {
             continue;
         }
-        if name == "dumpty" {
-            eprintln!("dumpty meta: {meta:?}");
-            eprintln!("dumpty symlink: {:?}", meta.is_symlink());
-            eprintln!("dumpty perm: {:?}", meta.permissions());
-        }
+        eprintln!("{name} meta: {meta:?}");
+        eprintln!("{name} symlink: {:?}", meta.is_symlink());
+        eprintln!("{name} perm: {:?}", meta.permissions());
         let mode = meta.st_mode();
         let sha1 = if meta.is_dir() {
             write_tree_object(&entry.path())?
