@@ -3,6 +3,7 @@ use sha1::Digest;
 
 use std::env;
 use std::fs;
+use std::os::unix::prelude::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -77,13 +78,19 @@ struct GitBlob(Vec<u8>);
 
 #[derive(Debug, Clone)]
 struct GitTreeEntry {
-    mode: u16,
+    mode: u32,
     name: String,
     sha1: GitSha1,
 }
 
 #[derive(Debug, Clone)]
 struct GitTree(Vec<GitTreeEntry>);
+
+impl GitTree {
+    fn new() -> Self {
+        Self(vec![])
+    }
+}
 
 #[derive(Debug, Clone)]
 enum GitObject {
@@ -113,7 +120,7 @@ fn parse_tree_object(data: &[u8]) -> anyhow::Result<GitObject> {
             .take_while(|b| *b != b' ')
             .collect();
         offset += mode.len() + 1;
-        let mode = u16::from_str_radix(std::str::from_utf8(&mode)?, 8)?;
+        let mode = u32::from_str_radix(std::str::from_utf8(&mode)?, 8)?;
 
         let name: Vec<u8> = data
             .iter()
@@ -257,6 +264,101 @@ fn ls_tree(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn write_blob_object(path: &Path, actually_write: bool) -> anyhow::Result<GitSha1> {
+    let root = find_git_root()?;
+
+    let contents = std::fs::read(path).context("Unable to read source file for object")?;
+    let content_length = format!("{}", contents.len());
+    let mut serialized = vec![b'b', b'l', b'o', b'b', b' '];
+    serialized.extend(content_length.bytes());
+    serialized.push(0);
+    serialized.extend(contents);
+
+    let mut hasher = sha1::Sha1::new();
+    hasher.update(&serialized);
+    let hash = hasher.finalize();
+    let hash = GitSha1(hex::encode(hash));
+
+    if actually_write {
+        let (sha_dir, sha_file_name) = hash.as_ref().split_at(2);
+        let object_path = root
+            .join(".git")
+            .join("objects")
+            .join(sha_dir)
+            .join(sha_file_name);
+        let compressed = zlib::compress(&serialized)?;
+        fs::create_dir_all(object_path.parent().unwrap())?;
+        fs::write(object_path, compressed)?;
+    }
+
+    Ok(hash)
+}
+
+fn write_tree_object(directory: &Path) -> anyhow::Result<GitSha1> {
+    let mut tree = GitTree::new();
+
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let meta = entry.metadata()?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow!("Invalid file name!"))?;
+        let mode = meta.mode();
+        let sha1 = if meta.is_dir() {
+            write_tree_object(&entry.path())?
+        } else {
+            write_blob_object(&entry.path(), true)?
+        };
+        tree.0.push(GitTreeEntry { name, mode, sha1 });
+    }
+
+    // Actually write the tree
+    let root = find_git_root()?;
+
+    let contents = tree.0.into_iter().fold(vec![], |mut v, e| {
+        let mode = format!("{:o} {}", e.mode, e.name);
+        v.extend(mode.bytes());
+        v.push(0);
+        let sha1 = hex::decode(e.sha1.0).unwrap();
+        v.extend(sha1);
+        v
+    });
+
+    let content_length = format!("{}", contents.len());
+    let mut serialized = vec![b't', b'r', b'e', b'e', b' '];
+    serialized.extend(content_length.bytes());
+    serialized.push(0);
+    serialized.extend(contents);
+
+    let mut hasher = sha1::Sha1::new();
+    hasher.update(&serialized);
+    let hash = hasher.finalize();
+    let hash = GitSha1(hex::encode(hash));
+
+    let (sha_dir, sha_file_name) = hash.as_ref().split_at(2);
+    let object_path = root
+        .join(".git")
+        .join("objects")
+        .join(sha_dir)
+        .join(sha_file_name);
+    let compressed = zlib::compress(&serialized)?;
+    fs::create_dir_all(object_path.parent().unwrap())?;
+    fs::write(object_path, compressed)?;
+
+    Ok(hash)
+}
+
+/// Writes the contents of the current working directory as a tree
+fn write_tree(_args: &[String]) -> anyhow::Result<()> {
+    let current_dir = std::env::current_dir()?;
+
+    let sha1 = write_tree_object(&current_dir)?;
+    println!("{sha1:?}");
+
+    Ok(())
+}
+
 /// Stores a blob into the object store and prints the hash of the object.
 fn hash_object(args: &[String]) -> anyhow::Result<()> {
     let write_to_db = args.iter().find(|a| *a == "-w").is_some();
@@ -312,6 +414,8 @@ fn main() -> anyhow::Result<()> {
         hash_object(&args[2..])?
     } else if args[1] == "ls-tree" {
         ls_tree(&args[2..])?
+    } else if args[1] == "write-tree" {
+        write_tree(&args[2..])?
     } else {
         println!("unknown command: {}", args[1])
     };

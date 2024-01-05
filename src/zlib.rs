@@ -34,7 +34,7 @@ pub fn compress(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     loop {
         let in_offset = compressor.total_in() as usize;
 
-        const BLOCK_SIZE: usize = 128;
+        const BLOCK_SIZE: usize = 0x4000;
         compressed.reserve_exact(BLOCK_SIZE);
 
         if in_offset == data.len() {
