@@ -1,8 +1,12 @@
 use anyhow::{anyhow, bail, Context};
-use flate2::Status;
+use sha1::Digest;
+
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
+
+mod zlib;
 
 /// Autodetects the root git directory by attempting to find the .git
 /// directory inside it and traversing the directory structure upwards
@@ -28,15 +32,15 @@ fn find_git_root() -> anyhow::Result<PathBuf> {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-struct Sha1(String);
+struct GitSha1(String);
 
-impl AsRef<str> for Sha1 {
+impl AsRef<str> for GitSha1 {
     fn as_ref(&self) -> &str {
         &self.0
     }
 }
 
-impl TryFrom<&str> for Sha1 {
+impl TryFrom<&str> for GitSha1 {
     type Error = anyhow::Error;
     fn try_from(val: &str) -> anyhow::Result<Self> {
         const SHA1_LEN: usize = 40;
@@ -48,11 +52,11 @@ impl TryFrom<&str> for Sha1 {
             bail!("value is not alphanumeric: {}", val);
         }
 
-        Ok(Sha1(val.to_string()))
+        Ok(GitSha1(val.to_string()))
     }
 }
 
-impl TryFrom<String> for Sha1 {
+impl TryFrom<String> for GitSha1 {
     type Error = anyhow::Error;
     fn try_from(val: String) -> anyhow::Result<Self> {
         const SHA1_LEN: usize = 40;
@@ -64,7 +68,7 @@ impl TryFrom<String> for Sha1 {
             bail!("value is not alphanumeric: {}", val);
         }
 
-        Ok(Sha1(val))
+        Ok(GitSha1(val))
     }
 }
 
@@ -98,11 +102,12 @@ fn parse_object(data: &[u8]) -> anyhow::Result<GitObject> {
     match ty {
         "blob" => parse_blob_object(contents),
         "commit" => unimplemented!(),
+        "tree" => unimplemented!(),
         t => Err(anyhow!("Invalid git object type found: {t}")),
     }
 }
 
-fn read_object(git_root: &Path, object_sha: &Sha1) -> anyhow::Result<GitObject> {
+fn read_object(git_root: &Path, object_sha: &GitSha1) -> anyhow::Result<GitObject> {
     let (sha_dir, sha_file_name) = object_sha.as_ref().split_at(2);
     let contents = fs::read(
         git_root
@@ -112,28 +117,7 @@ fn read_object(git_root: &Path, object_sha: &Sha1) -> anyhow::Result<GitObject> 
     )
     .with_context(|| format!("Unable to read object {object_sha:?}"))?;
 
-    let mut dec = flate2::Decompress::new(true);
-    let mut decompressed = vec![];
-
-    loop {
-        let in_offset = dec.total_in() as usize;
-
-        const BLOCK_SIZE: usize = 128;
-        decompressed.reserve_exact(BLOCK_SIZE);
-
-        let status = dec.decompress_vec(
-            &contents[in_offset..],
-            &mut decompressed,
-            flate2::FlushDecompress::Sync,
-        )?;
-
-        if status == Status::StreamEnd {
-            break;
-        } else if status == Status::BufError {
-            anyhow::bail!("zlib decompression error");
-        }
-    }
-
+    let decompressed = zlib::decompress(&contents)?;
     parse_object(&decompressed)
 }
 
@@ -154,7 +138,7 @@ fn init_dir() -> anyhow::Result<()> {
 fn cat_file(args: &[String]) -> anyhow::Result<()> {
     // let pretty_print = args.iter().find(|a| *a == "-p").is_some();
 
-    let object_sha: Sha1 = args
+    let object_sha: GitSha1 = args
         .iter()
         .skip_while(|arg| arg.starts_with("-"))
         .next()
@@ -176,6 +160,47 @@ fn cat_file(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Stores a blob into the object store and prints the hash of the object.
+fn hash_object(args: &[String]) -> anyhow::Result<()> {
+    let write_to_db = args.iter().find(|a| *a == "-w").is_some();
+
+    let file_path: PathBuf = args
+        .iter()
+        .skip_while(|arg| arg.starts_with("-"))
+        .next()
+        .ok_or(anyhow!("hash-object requires argument \"<file>\""))
+        .and_then(|s| Ok(PathBuf::from_str(&s)?))?;
+
+    let root = find_git_root()?;
+
+    let contents = std::fs::read(file_path).context("Unable to read source file for object")?;
+    let content_length = format!("{}", contents.len());
+    let mut serialized = vec![b'b', b'l', b'o', b'b', b' '];
+    serialized.extend(content_length.bytes());
+    serialized.push(0);
+    serialized.extend(contents);
+
+    let mut hasher = sha1::Sha1::new();
+    hasher.update(&serialized);
+    let hash = hasher.finalize();
+    let hash = GitSha1(hex::encode(hash));
+    println!("{hash:?}");
+
+    if write_to_db {
+        let (sha_dir, sha_file_name) = hash.as_ref().split_at(2);
+        let object_path = root
+            .join(".git")
+            .join("objects")
+            .join(sha_dir)
+            .join(sha_file_name);
+        let compressed = zlib::compress(&serialized)?;
+        fs::create_dir_all(object_path.parent().unwrap())?;
+        fs::write(object_path, compressed)?;
+    }
+
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -186,6 +211,8 @@ fn main() -> anyhow::Result<()> {
         init_dir()?
     } else if args[1] == "cat-file" {
         cat_file(&args[2..])?
+    } else if args[1] == "hash-object" {
+        hash_object(&args[2..])?
     } else {
         println!("unknown command: {}", args[1])
     };
