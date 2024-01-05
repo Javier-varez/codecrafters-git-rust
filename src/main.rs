@@ -354,7 +354,7 @@ fn write_tree(_args: &[String]) -> anyhow::Result<()> {
     let current_dir = std::env::current_dir()?;
 
     let sha1 = write_tree_object(&current_dir)?;
-    println!("{sha1:?}");
+    println!("{}", sha1.0);
 
     Ok(())
 }
