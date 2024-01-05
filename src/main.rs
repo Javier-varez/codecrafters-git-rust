@@ -307,11 +307,13 @@ fn write_tree_object(directory: &Path) -> anyhow::Result<GitSha1> {
         if name == ".git" {
             continue;
         }
-        let mode = meta.permissions().mode();
-        let sha1 = if meta.is_dir() {
-            write_tree_object(&entry.path())?
+        let (mode, sha1) = if meta.is_dir() {
+            (0o040000, write_tree_object(&entry.path())?)
         } else {
-            write_blob_object(&entry.path(), true)?
+            (
+                meta.permissions().mode(),
+                write_blob_object(&entry.path(), true)?,
+            )
         };
         tree.0.push(GitTreeEntry { name, mode, sha1 });
     }
