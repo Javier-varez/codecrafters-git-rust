@@ -406,6 +406,60 @@ fn hash_object(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Creates a commit
+fn commit_tree(args: &[String]) -> anyhow::Result<()> {
+    if args.len() == 0 {
+        bail!("Expected at least an argument for the tree hash");
+    }
+
+    let tree_hash: &str = &args[0];
+    let tree_hash: GitSha1 = tree_hash.try_into()?;
+
+    let parent = args.iter().skip_while(|a| *a != "-p").skip(1).next();
+    let message = args
+        .iter()
+        .skip_while(|a| *a != "-m")
+        .skip(1)
+        .next()
+        .ok_or(anyhow!("Expected a message for the commit"))?;
+
+    let root = find_git_root()?;
+
+    let mut contents = format!("tree {}\n", tree_hash.as_ref());
+    if let Some(parent) = parent {
+        contents.extend(format!("parent {}\n", parent).chars());
+    }
+    contents.extend("author John Doe <john@doe> 0 +0000\n".chars());
+    contents.extend("committer John Doe <john@doe> 0 +0000\n".chars());
+    contents.extend("\n".chars());
+    contents.extend(message.chars());
+    contents.extend("\n".chars());
+
+    let content_length = format!("{}", contents.bytes().count());
+    let mut serialized = vec![b'c', b'o', b'm', b'm', b'i', b't', b' '];
+    serialized.extend(content_length.bytes());
+    serialized.push(0);
+    serialized.extend(contents.bytes());
+
+    let mut hasher = sha1::Sha1::new();
+    hasher.update(&serialized);
+    let hash = hasher.finalize();
+    let hash = GitSha1(hex::encode(hash));
+
+    let (sha_dir, sha_file_name) = hash.as_ref().split_at(2);
+    let object_path = root
+        .join(".git")
+        .join("objects")
+        .join(sha_dir)
+        .join(sha_file_name);
+    let compressed = zlib::compress(&serialized)?;
+    fs::create_dir_all(object_path.parent().unwrap())?;
+    fs::write(object_path, compressed)?;
+    println!("{}", hash.as_ref());
+
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -422,6 +476,8 @@ fn main() -> anyhow::Result<()> {
         ls_tree(&args[2..])?
     } else if args[1] == "write-tree" {
         write_tree(&args[2..])?
+    } else if args[1] == "commit-tree" {
+        commit_tree(&args[2..])?
     } else {
         println!("unknown command: {}", args[1])
     };
