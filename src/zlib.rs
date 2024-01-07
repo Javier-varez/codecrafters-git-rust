@@ -2,29 +2,8 @@ use anyhow::bail;
 use flate2::Status;
 
 pub fn decompress(data: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let mut dec = flate2::Decompress::new(true);
-    let mut decompressed = vec![];
-
-    loop {
-        let in_offset = dec.total_in() as usize;
-
-        const BLOCK_SIZE: usize = 128;
-        decompressed.reserve_exact(BLOCK_SIZE);
-
-        let status = dec.decompress_vec(
-            &data[in_offset..],
-            &mut decompressed,
-            flate2::FlushDecompress::Sync,
-        )?;
-
-        if status == Status::StreamEnd {
-            break;
-        } else if status == Status::BufError {
-            bail!("zlib decompression error");
-        }
-    }
-
-    Ok(decompressed)
+    let (res, _) = decompress_with_consumed_input(data)?;
+    Ok(res)
 }
 
 pub fn compress(data: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -59,4 +38,30 @@ pub fn compress(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     }
 
     Ok(compressed)
+}
+
+pub fn decompress_with_consumed_input(data: &[u8]) -> anyhow::Result<(Vec<u8>, usize)> {
+    let mut dec = flate2::Decompress::new(true);
+    let mut decompressed = vec![];
+
+    loop {
+        let in_offset = dec.total_in() as usize;
+
+        const BLOCK_SIZE: usize = 128;
+        decompressed.reserve_exact(BLOCK_SIZE);
+
+        let status = dec.decompress_vec(
+            &data[in_offset..],
+            &mut decompressed,
+            flate2::FlushDecompress::Sync,
+        )?;
+
+        if status == Status::StreamEnd {
+            break;
+        } else if status == Status::BufError {
+            bail!("zlib decompression error");
+        }
+    }
+
+    Ok((decompressed, dec.total_in() as usize))
 }

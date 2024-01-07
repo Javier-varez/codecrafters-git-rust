@@ -1,4 +1,6 @@
 use anyhow::{anyhow, bail, Context};
+use reqwest::StatusCode;
+use reqwest::Url;
 use sha1::Digest;
 
 use std::env;
@@ -6,8 +8,19 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
+mod gitsha1;
+mod object;
+mod packfile;
 mod zlib;
+
+use gitsha1::GitSha1;
+use object::GitBlob;
+use object::GitObject;
+use object::GitTree;
+use object::GitTreeEntry;
 
 /// Autodetects the root git directory by attempting to find the .git
 /// directory inside it and traversing the directory structure upwards
@@ -32,144 +45,7 @@ fn find_git_root() -> anyhow::Result<PathBuf> {
     Ok(git_root.to_path_buf())
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-struct GitSha1(String);
-
-impl AsRef<str> for GitSha1 {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl TryFrom<&str> for GitSha1 {
-    type Error = anyhow::Error;
-    fn try_from(val: &str) -> anyhow::Result<Self> {
-        const SHA1_LEN: usize = 40;
-        if val.len() != SHA1_LEN {
-            bail!("Unexpected length for sha1: {}", val.len());
-        }
-        let is_alphanumeric = val.chars().all(|c| c.is_alphanumeric());
-        if !is_alphanumeric {
-            bail!("value is not alphanumeric: {}", val);
-        }
-
-        Ok(GitSha1(val.to_string()))
-    }
-}
-
-impl TryFrom<String> for GitSha1 {
-    type Error = anyhow::Error;
-    fn try_from(val: String) -> anyhow::Result<Self> {
-        const SHA1_LEN: usize = 40;
-        if val.len() != SHA1_LEN {
-            bail!("Unexpected length for sha1: {}", val.len());
-        }
-        let is_alphanumeric = val.chars().all(|c| c.is_alphanumeric());
-        if !is_alphanumeric {
-            bail!("value is not alphanumeric: {}", val);
-        }
-
-        Ok(GitSha1(val))
-    }
-}
-
-#[derive(Debug, Clone)]
-struct GitBlob(Vec<u8>);
-
-#[derive(Debug, Clone)]
-struct GitTreeEntry {
-    mode: u32,
-    name: String,
-    sha1: GitSha1,
-}
-
-#[derive(Debug, Clone)]
-struct GitTree(Vec<GitTreeEntry>);
-
-impl GitTree {
-    fn new() -> Self {
-        Self(vec![])
-    }
-}
-
-#[derive(Debug, Clone)]
-enum GitObject {
-    Blob(GitBlob),
-    Tree(GitTree),
-}
-
-fn parse_blob_object(data: &[u8]) -> anyhow::Result<GitObject> {
-    Ok(GitObject::Blob(GitBlob(data.to_vec())))
-}
-
 trait MyIter: Iterator<Item = u8> + Clone {}
-
-fn parse_tree_object(data: &[u8]) -> anyhow::Result<GitObject> {
-    let mut entries = vec![];
-    let mut offset = 0;
-
-    loop {
-        if offset >= data.len() {
-            break;
-        }
-
-        let mode: Vec<u8> = data
-            .iter()
-            .cloned()
-            .skip(offset)
-            .take_while(|b| *b != b' ')
-            .collect();
-        offset += mode.len() + 1;
-        let mode = u32::from_str_radix(std::str::from_utf8(&mode)?, 8)?;
-
-        let name: Vec<u8> = data
-            .iter()
-            .cloned()
-            .skip(offset)
-            .take_while(|b| *b != 0)
-            .collect();
-        let name = std::str::from_utf8(&name)?.to_string();
-        offset += name.bytes().count() + 1;
-
-        const HASH_LEN: usize = 20;
-        let hash: Vec<u8> = data.iter().cloned().skip(offset).take(HASH_LEN).collect();
-        let hash: GitSha1 = hex::encode(hash).try_into()?;
-
-        offset += HASH_LEN;
-        entries.push(GitTreeEntry {
-            name,
-            sha1: hash,
-            mode,
-        });
-    }
-
-    Ok(GitObject::Tree(GitTree(entries)))
-}
-
-fn parse_object(data: &[u8]) -> anyhow::Result<GitObject> {
-    let header: Vec<_> = data.iter().take_while(|b| **b != 0).map(|b| *b).collect();
-
-    let header = std::str::from_utf8(&header)?;
-    let (ty, length): (&str, usize) = {
-        let mut iter = header.split_whitespace();
-        (
-            iter.next().ok_or(anyhow!("Header is empty"))?,
-            iter.next().ok_or(anyhow!("No length in header"))?.parse()?,
-        )
-    };
-
-    let (_, contents) = data.split_at(header.len() + 1);
-    if length != contents.len() {
-        bail!("Missing contents for git object. Header indicates {length} bytes, but only {} are available", contents.len());
-    }
-
-    match ty {
-        "blob" => parse_blob_object(contents),
-        "tree" => parse_tree_object(contents),
-        "commit" => unimplemented!(),
-        t => Err(anyhow!("Invalid git object type found: {t}")),
-    }
-}
 
 fn read_object(git_root: &Path, object_sha: &GitSha1) -> anyhow::Result<GitObject> {
     let (sha_dir, sha_file_name) = object_sha.as_ref().split_at(2);
@@ -182,7 +58,7 @@ fn read_object(git_root: &Path, object_sha: &GitSha1) -> anyhow::Result<GitObjec
     .with_context(|| format!("Unable to read object {object_sha:?}"))?;
 
     let decompressed = zlib::decompress(&contents)?;
-    parse_object(&decompressed)
+    GitObject::parse(&decompressed)
 }
 
 /// Initializes a new git repository in the current directory
@@ -217,12 +93,15 @@ fn cat_file(args: &[String]) -> anyhow::Result<()> {
     let object = read_object(&root, &object_sha)?;
     match object {
         GitObject::Blob(blob) => {
-            print!("{}", std::str::from_utf8(&blob.0)?);
+            print!("{}", std::str::from_utf8(blob.content())?);
         }
         GitObject::Tree(tree) => {
-            for entry in &tree.0 {
+            for entry in tree.entries() {
                 println!("{}", entry.name);
             }
+        }
+        GitObject::Commit(commit) => {
+            unimplemented!()
         }
     }
 
@@ -249,7 +128,7 @@ fn ls_tree(args: &[String]) -> anyhow::Result<()> {
     match object {
         GitObject::Tree(tree) => {
             if name_only {
-                for entry in &tree.0 {
+                for entry in tree.entries() {
                     println!("{}", entry.name);
                 }
             } else {
@@ -268,16 +147,13 @@ fn write_blob_object(path: &Path, actually_write: bool) -> anyhow::Result<GitSha
     let root = find_git_root()?;
 
     let contents = std::fs::read(path).context("Unable to read source file for object")?;
-    let content_length = format!("{}", contents.len());
-    let mut serialized = vec![b'b', b'l', b'o', b'b', b' '];
-    serialized.extend(content_length.bytes());
-    serialized.push(0);
-    serialized.extend(contents);
+    let blob = GitObject::Blob(GitBlob::new(contents));
+    let serialized = blob.serialize();
 
     let mut hasher = sha1::Sha1::new();
     hasher.update(&serialized);
     let hash = hasher.finalize();
-    let hash = GitSha1(hex::encode(hash));
+    let hash: GitSha1 = hex::encode(hash).try_into()?;
 
     if actually_write {
         let (sha_dir, sha_file_name) = hash.as_ref().split_at(2);
@@ -295,7 +171,7 @@ fn write_blob_object(path: &Path, actually_write: bool) -> anyhow::Result<GitSha
 }
 
 fn write_tree_object(directory: &Path) -> anyhow::Result<GitSha1> {
-    let mut tree = GitTree::new();
+    let mut tree = vec![];
 
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
@@ -315,32 +191,19 @@ fn write_tree_object(directory: &Path) -> anyhow::Result<GitSha1> {
                 write_blob_object(&entry.path(), true)?,
             )
         };
-        tree.0.push(GitTreeEntry { name, mode, sha1 });
+        tree.push(GitTreeEntry { name, mode, sha1 });
     }
-    tree.0.sort_by(|left, right| left.name.cmp(&right.name));
+    tree.sort_by(|left, right| left.name.cmp(&right.name));
+    let tree = GitObject::Tree(GitTree::new(tree));
+    let serialized = tree.serialize();
 
     // Actually write the tree
     let root = find_git_root()?;
 
-    let contents = tree.0.into_iter().fold(vec![], |mut v, e| {
-        let mode = format!("{:o} {}", e.mode, e.name);
-        v.extend(mode.bytes());
-        v.push(0);
-        let sha1 = hex::decode(e.sha1.0).unwrap();
-        v.extend(sha1);
-        v
-    });
-
-    let content_length = format!("{}", contents.len());
-    let mut serialized = vec![b't', b'r', b'e', b'e', b' '];
-    serialized.extend(content_length.bytes());
-    serialized.push(0);
-    serialized.extend(contents);
-
     let mut hasher = sha1::Sha1::new();
     hasher.update(&serialized);
     let hash = hasher.finalize();
-    let hash = GitSha1(hex::encode(hash));
+    let hash: GitSha1 = hex::encode(hash).try_into()?;
 
     let (sha_dir, sha_file_name) = hash.as_ref().split_at(2);
     let object_path = root
@@ -360,7 +223,7 @@ fn write_tree(_args: &[String]) -> anyhow::Result<()> {
     let current_dir = std::env::current_dir()?;
 
     let sha1 = write_tree_object(&current_dir)?;
-    println!("{}", sha1.0);
+    println!("{}", sha1.as_ref());
 
     Ok(())
 }
@@ -388,7 +251,7 @@ fn hash_object(args: &[String]) -> anyhow::Result<()> {
     let mut hasher = sha1::Sha1::new();
     hasher.update(&serialized);
     let hash = hasher.finalize();
-    let hash = GitSha1(hex::encode(hash));
+    let hash: GitSha1 = hex::encode(hash).try_into()?;
     println!("{hash:?}");
 
     if write_to_db {
@@ -425,12 +288,13 @@ fn commit_tree(args: &[String]) -> anyhow::Result<()> {
 
     let root = find_git_root()?;
 
+    let time: u64 = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let mut contents = format!("tree {}\n", tree_hash.as_ref());
     if let Some(parent) = parent {
         contents.extend(format!("parent {}\n", parent).chars());
     }
-    contents.extend("author John Doe <john@doe> 0 +0000\n".chars());
-    contents.extend("committer John Doe <john@doe> 0 +0000\n".chars());
+    contents.extend(format!("author John Doe <john@doe> {time} +0000\n").chars());
+    contents.extend(format!("committer John Doe <john@doe> {time} +0000\n").chars());
     contents.extend("\n".chars());
     contents.extend(message.chars());
     contents.extend("\n".chars());
@@ -444,7 +308,7 @@ fn commit_tree(args: &[String]) -> anyhow::Result<()> {
     let mut hasher = sha1::Sha1::new();
     hasher.update(&serialized);
     let hash = hasher.finalize();
-    let hash = GitSha1(hex::encode(hash));
+    let hash: GitSha1 = hex::encode(hash).try_into()?;
 
     let (sha_dir, sha_file_name) = hash.as_ref().split_at(2);
     let object_path = root
@@ -456,6 +320,279 @@ fn commit_tree(args: &[String]) -> anyhow::Result<()> {
     fs::create_dir_all(object_path.parent().unwrap())?;
     fs::write(object_path, compressed)?;
     println!("{}", hash.as_ref());
+
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+enum PktLine {
+    Flush,
+    Delimiter,
+    Data(Vec<u8>),
+}
+
+impl PktLine {
+    fn pack_all(lines: &[PktLine]) -> Vec<u8> {
+        let mut result = vec![];
+        for e in lines {
+            match e {
+                PktLine::Flush => {
+                    let len = 0u16;
+                    let len = len.to_be_bytes();
+                    let len = hex::encode(len);
+                    result.extend(len.bytes());
+                }
+                PktLine::Delimiter => {
+                    let len = 1u16;
+                    let len = len.to_be_bytes();
+                    let len = hex::encode(len);
+                    result.extend(len.bytes());
+                }
+                PktLine::Data(data) => {
+                    let len = data.len() as u16 + 5;
+                    let len = len.to_be_bytes();
+                    let len = hex::encode(len);
+                    result.extend(len.bytes());
+                    result.extend(data.iter());
+                    result.push(b'\n');
+                }
+            }
+        }
+        result
+    }
+
+    fn unpack_all(content: &[u8]) -> anyhow::Result<Vec<PktLine>> {
+        let mut offset = 0;
+        let mut data = vec![];
+
+        loop {
+            let len: Vec<u8> = content.iter().skip(offset).take(4).cloned().collect();
+            if len.len() == 0 {
+                return Ok(data);
+            } else if len.len() != 4 {
+                bail!("Not enough lines to unpack packetline");
+            }
+
+            let len = hex::decode(len).context("Invalid pkt-line length")?;
+            let len =
+                u16::from_be_bytes(len.try_into().expect("Invalid packet length as str")) as usize;
+
+            if len == 0 {
+                data.push(PktLine::Flush);
+                offset += 4;
+            } else if len == 1 {
+                data.push(PktLine::Delimiter);
+                offset += 4;
+            } else {
+                let entry = PktLine::Data(
+                    content
+                        .iter()
+                        .skip(offset + 4)
+                        .cloned()
+                        .take(len - 4)
+                        .collect(),
+                );
+                data.push(entry);
+                offset += len;
+            }
+        }
+    }
+
+    fn unpack_while_possible(content: &[u8]) -> anyhow::Result<(Vec<PktLine>, &[u8])> {
+        let mut offset = 0;
+        let mut data = vec![];
+
+        loop {
+            let len: Vec<u8> = content.iter().skip(offset).take(4).cloned().collect();
+            if len.len() == 0 {
+                return Ok((data, &[]));
+            } else if len.len() != 4 {
+                bail!("Not enough lines to unpack packetline");
+            }
+
+            let len = match hex::decode(len) {
+                Ok(len) => len,
+                Err(_) => {
+                    // Assume this is no longer a pkt-line
+                    return Ok((data, &content[offset..]));
+                }
+            };
+            let len =
+                u16::from_be_bytes(len.try_into().expect("Invalid packet length as str")) as usize;
+
+            if len == 0 {
+                data.push(PktLine::Flush);
+                offset += 4;
+            } else if len == 1 {
+                data.push(PktLine::Delimiter);
+                offset += 4;
+            } else {
+                let entry = PktLine::Data(
+                    content
+                        .iter()
+                        .skip(offset + 4)
+                        .cloned()
+                        .take(len - 4)
+                        .collect(),
+                );
+                data.push(entry);
+                offset += len;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GitRef {
+    sha1: GitSha1,
+    name: String,
+}
+
+struct GitClient {
+    repo_url: Url,
+    path: PathBuf,
+}
+
+impl GitClient {
+    fn new(repo_url: Url, path: PathBuf) -> Self {
+        Self { repo_url, path }
+    }
+
+    fn discover_refs(&self) -> anyhow::Result<Vec<GitRef>> {
+        let url = self.repo_url.join("info/refs")?;
+        let response = reqwest::blocking::Client::builder()
+            .build()?
+            .get(url)
+            .query(&[("service", "git-upload-pack")])
+            .send()?;
+
+        if response.status() != StatusCode::OK {
+            bail!(
+                "Server replied with unexpected status code: {}",
+                response.status()
+            );
+        }
+
+        let is_smart_server = response
+            .headers()
+            .get("content-type")
+            .is_some_and(|v| v == "application/x-git-upload-pack-advertisement");
+        if !is_smart_server {
+            bail!("Only smart git servers are supported");
+        }
+
+        let bytes = response.bytes()?;
+        let pkt_lines = PktLine::unpack_all(&bytes)?;
+
+        let refs = pkt_lines
+            .iter()
+            .skip_while(|e| !matches!(e, PktLine::Flush))
+            .skip(1)
+            .take_while(|e| !matches!(e, PktLine::Flush))
+            .map(|e| -> anyhow::Result<GitRef> {
+                match e {
+                    PktLine::Data(data) => {
+                        let sha1: GitSha1 = std::str::from_utf8(
+                            &data.iter().take(40).cloned().collect::<Vec<u8>>(),
+                        )?
+                        .try_into()?;
+                        let end = data
+                            .iter()
+                            .enumerate()
+                            .skip(41)
+                            .find(|(_i, v)| **v == 0 || **v == b'\n')
+                            .map(|(i, _)| i)
+                            .ok_or(anyhow!("Expected end of line in marker"))?;
+                        let name = std::str::from_utf8(&data[41..end])?.to_string();
+                        Ok(GitRef { sha1, name })
+                    }
+                    PktLine::Delimiter => {
+                        panic!("Unexpected marker!");
+                    }
+                    PktLine::Flush => {
+                        panic!("Unexpected marker!");
+                    }
+                }
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        Ok(refs)
+    }
+
+    pub fn get_ref(&self, r: &GitRef) -> anyhow::Result<()> {
+        let url = self.repo_url.join("git-upload-pack")?;
+        let lines = [
+            PktLine::Data("command=fetch".to_string().into_bytes()),
+            PktLine::Data("object-format=sha1".to_string().into_bytes()),
+            PktLine::Delimiter,
+            PktLine::Data("thin-pack".to_string().into_bytes()),
+            PktLine::Data("ofs-delta".to_string().into_bytes()),
+            PktLine::Data(format!("want {}", r.sha1.as_ref()).into_bytes()),
+            PktLine::Data("done".to_string().into_bytes()),
+            PktLine::Flush,
+        ];
+        let body = PktLine::pack_all(&lines);
+        println!("body: {}", std::str::from_utf8(&body)?);
+        let response = reqwest::blocking::Client::builder()
+            .build()?
+            .post(url)
+            .header("Content-Type", "application/x-git-upload-pack-request")
+            .header("Accept", "application/x-git-upload-pack-result")
+            .header("git-protocol", "version=2")
+            .body(body)
+            .send()?;
+
+        if response.status() != StatusCode::OK {
+            bail!(
+                "Server replied with unexpected status code: {}",
+                response.status()
+            );
+        }
+
+        let bytes = response.bytes()?;
+        let packs = PktLine::unpack_all(&bytes)?;
+
+        const PACK_MARKER: u8 = 1;
+        const MSG_MARKER: u8 = 2;
+        let mut packfile: Vec<u8> = vec![];
+        for pack in packs {
+            match pack {
+                PktLine::Data(d) => {
+                    if d.iter().next().is_some_and(|val| *val == PACK_MARKER) {
+                        packfile.extend(d.iter().skip(1));
+                    } else if d.iter().next().is_some_and(|val| *val == MSG_MARKER) {
+                        let msg = String::from_utf8_lossy(&d[1..]);
+                        println!("{msg}");
+                    }
+                }
+                PktLine::Flush | PktLine::Delimiter => {}
+            }
+        }
+
+        // let curdir = current_dir()?;
+        // std::fs::write(curdir.join("packfile.pack"), &packfile)?;
+        let packfile = packfile::parse(&packfile)?;
+
+        Ok(())
+    }
+}
+
+fn clone(args: &[String]) -> anyhow::Result<()> {
+    if args.len() < 2 {
+        bail!("not enough arguments");
+    }
+
+    let mut url = args[0].clone();
+    if !url.ends_with("/") {
+        url.push('/');
+    }
+    let url = Url::parse(&url)?;
+    let path = PathBuf::from_str(&args[1])?;
+    let client = GitClient::new(url, path);
+
+    let refs = client.discover_refs()?;
+    let head = refs.iter().find(|r| r.name == "HEAD").unwrap();
+    client.get_ref(head)?;
 
     Ok(())
 }
@@ -478,6 +615,8 @@ fn main() -> anyhow::Result<()> {
         write_tree(&args[2..])?
     } else if args[1] == "commit-tree" {
         commit_tree(&args[2..])?
+    } else if args[1] == "clone" {
+        clone(&args[2..])?
     } else {
         println!("unknown command: {}", args[1])
     };
