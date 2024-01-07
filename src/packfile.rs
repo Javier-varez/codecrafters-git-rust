@@ -14,7 +14,7 @@ struct Header {
 
 #[derive(Debug, Clone)]
 pub struct PackFile {
-    pub objects: HashMap<usize, GitObject>,
+    pub objects: Vec<GitObject>,
 }
 
 #[non_exhaustive]
@@ -43,7 +43,7 @@ impl TryFrom<u8> for PackType {
     }
 }
 
-fn decode_variable_length_int(data: &[u8]) -> anyhow::Result<(PackType, usize, usize)> {
+fn decode_type_and_length(data: &[u8]) -> anyhow::Result<(PackType, usize, usize)> {
     const MASK: u8 = 0x7f;
     const TYPE_MASK: u8 = 0x70;
     const TYPE_OFF: u8 = 4;
@@ -79,6 +79,32 @@ fn decode_variable_length_int(data: &[u8]) -> anyhow::Result<(PackType, usize, u
     Ok((ty.unwrap(), result, consumed))
 }
 
+fn decode_variable_length_int(data: &[u8]) -> anyhow::Result<(usize, usize)> {
+    const MASK: u8 = 0x7f;
+    const CONT_BIT: u8 = 0x80;
+
+    let mut result = 0usize;
+    let mut consumed = 0;
+    let mut shift = 0;
+
+    let mut finished = false;
+
+    for byte in data {
+        result = result | ((byte & MASK) as usize) << shift;
+        shift += 7;
+        consumed += 1;
+
+        if byte & CONT_BIT == 0 {
+            finished = true;
+            break;
+        }
+    }
+    if !finished {
+        bail!("Ran out of data while parsing variable length integer");
+    }
+    Ok((result, consumed))
+}
+
 fn construct_git_object_from_raw_data(
     pack_type: PackType,
     data: &[u8],
@@ -108,7 +134,8 @@ fn leb64(data: &[u8]) -> anyhow::Result<(usize, usize)> {
 
     for byte in data {
         if consumed > 0 {
-            // TODO: I'm not sure where this comes from...
+            // Because the fact that there is another byte it means it cannot be 0,
+            // this encodes a bit more data (1-128)
             result += 1;
         }
         result = result << SHIFT | (byte & MASK) as usize;
@@ -124,6 +151,115 @@ fn leb64(data: &[u8]) -> anyhow::Result<(usize, usize)> {
         bail!("Ran out of data while parsing variable length integer for type and size");
     }
     Ok((result, consumed))
+}
+
+#[derive(Debug, Clone)]
+enum DeltaInst {
+    CopyBlob { offset: usize, size: usize },
+    AddData { data: Vec<u8> },
+}
+
+struct DeltaInstIter<'a> {
+    data: &'a [u8],
+    current_offset: usize,
+}
+
+impl<'a> DeltaInstIter<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            current_offset: 0,
+        }
+    }
+}
+
+impl<'a> std::iter::Iterator for DeltaInstIter<'a> {
+    type Item = DeltaInst;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current_offset >= self.data.len() {
+            return None;
+        }
+
+        const DIFF_MASK: u8 = 0x80;
+        const COPY_INST: u8 = 0x80;
+        let mut offset = self.current_offset;
+
+        let inst = self.data[offset];
+        if (inst & DIFF_MASK) == COPY_INST {
+            offset += 1;
+
+            let mut chunk_offset = 0usize;
+            for i in 0..4 {
+                let bit = 1u8 << i;
+                if inst & bit == bit {
+                    assert!(self.data.len() > offset);
+                    let part = self.data[offset] as usize;
+                    chunk_offset |= part << (8 * i);
+                    offset += 1;
+                }
+            }
+
+            let mut size = 0;
+            for i in 4..7 {
+                let bit = 1u8 << i;
+                if inst & bit == bit {
+                    assert!(self.data.len() > offset);
+                    let chunk = self.data[offset] as usize;
+                    size |= chunk << (8 * (i - 4));
+                    offset += 1;
+                }
+            }
+
+            self.current_offset = offset;
+            Some(DeltaInst::CopyBlob {
+                offset: chunk_offset,
+                size,
+            })
+        } else {
+            offset += 1;
+            let len = inst as usize;
+
+            let data: Vec<u8> = self.data.iter().cloned().skip(offset).take(len).collect();
+            assert_eq!(data.len(), len);
+            offset += len;
+
+            self.current_offset = offset;
+            Some(DeltaInst::AddData { data })
+        }
+    }
+}
+
+fn parse_ofs_delta_object(obj_data: &[u8], base_obj_data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut offset = 0;
+    let (base_obj_size, consumed) = decode_variable_length_int(&obj_data[offset..])?;
+    offset += consumed;
+    let (obj_size, consumed) = decode_variable_length_int(&obj_data[offset..])?;
+    offset += consumed;
+
+    if base_obj_size != base_obj_data.len() {
+        bail!(
+            "Stored base object size and actual base object size do not match: {} vs {}",
+            base_obj_data.len(),
+            base_obj_size
+        );
+    }
+
+    let mut result = vec![];
+    for inst in DeltaInstIter::new(&obj_data[offset..]) {
+        match inst {
+            DeltaInst::AddData { data } => {
+                result.extend(data);
+            }
+            DeltaInst::CopyBlob { offset, size } => {
+                result.extend(base_obj_data[offset..offset + size].iter());
+            }
+        }
+    }
+
+    if result.len() != obj_size {
+        bail!("Did not obtain the correct object size after following the instructions");
+    }
+    Ok(result)
 }
 
 pub fn parse(data: &[u8]) -> anyhow::Result<PackFile> {
@@ -142,7 +278,8 @@ pub fn parse(data: &[u8]) -> anyhow::Result<PackFile> {
     let header = Header { version, num_objs };
     dbg!(&header);
 
-    let mut objects = HashMap::new();
+    let mut object_map = HashMap::new();
+    let mut objects = vec![];
     let mut offset = HEADER_SIZE;
 
     for _ in 0..num_objs {
@@ -151,7 +288,7 @@ pub fn parse(data: &[u8]) -> anyhow::Result<PackFile> {
         }
 
         let obj_offset = offset;
-        let (ty, decompressed_size, consumed) = decode_variable_length_int(&data[offset..])?;
+        let (ty, decompressed_size, consumed) = decode_type_and_length(&data[offset..])?;
 
         offset += consumed;
         if offset >= data.len() {
@@ -167,35 +304,47 @@ pub fn parse(data: &[u8]) -> anyhow::Result<PackFile> {
                 let object = construct_git_object_from_raw_data(ty, &obj_data)?;
                 let hash = object.hash();
 
-                println!("hash: {hash:?}, type: {ty:?}, decompressed_size {decompressed_size}");
-                objects.insert(obj_offset, object);
-
                 if obj_data.len() != decompressed_size {
                     bail!("Decompressed size for object is not correct!");
                 }
+
+                println!("hash: {hash:?}, type: {ty:?}, decompressed_size {decompressed_size}");
+
+                object_map.insert(obj_offset, (hash, obj_data, ty));
+                objects.push(object);
             }
             PackType::OfsDelta => {
                 let (base_offset, consumed) = leb64(&data[offset..])?;
                 offset += consumed;
 
-                println!("Base offset: {base_offset}, consumed: {consumed}");
-                println!("Original obj {}", obj_offset - base_offset);
-                if let Some(obj) = objects.get(&(obj_offset - base_offset)) {
-                    let hash = obj.hash();
-                    println!("Original obj {hash:?}");
-                } else {
-                    println!("Unknwnon offset...");
+                let Some((base_obj_hash, base_obj_data, base_obj_type)) =
+                    object_map.get(&(obj_offset - base_offset))
+                else {
+                    bail!("Unknown base object at offset {base_offset}");
+                };
+
+                let (obj_data, compressed_size) =
+                    zlib::decompress_with_consumed_input(&data[offset..])?;
+                offset += compressed_size;
+
+                if obj_data.len() != decompressed_size {
+                    bail!("Decompressed size for object is not correct!");
                 }
 
-                unimplemented!()
+                let obj_data = parse_ofs_delta_object(&obj_data, base_obj_data)?;
+
+                let object = construct_git_object_from_raw_data(*base_obj_type, &obj_data)?;
+                let hash = object.hash();
+                println!("hash: {hash:?}, type: {ty:?}, base: {base_obj_hash:?}");
+
+                object_map.insert(obj_offset, (hash, obj_data, *base_obj_type));
+                objects.push(object);
             }
             PackType::RefDelta => {
                 bail!("Unexpected compressed data in ref-delta format");
             }
         }
     }
-
-    bail!("REMOVE ME");
 
     Ok(PackFile { objects })
 }
@@ -225,6 +374,7 @@ mod tests {
     fn test_leb64() {
         let input = [0xe5, 0x8e, 0x26];
         assert_eq!(leb64(&input).unwrap().0 as u64, otherLeb64(&input).0);
+        assert_eq!(leb64(&input).unwrap().1, otherLeb64(&input).1);
     }
 
     #[test]
