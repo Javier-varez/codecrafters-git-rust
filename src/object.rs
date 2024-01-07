@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail};
+use anyhow::{anyhow, bail, Context};
 
 use crate::gitsha1::GitSha1;
 use sha1::Digest;
@@ -16,7 +16,6 @@ impl GitBlob {
     }
 
     pub fn parse(data: &[u8]) -> anyhow::Result<Self> {
-        // TODO: Make this parse the data on construction
         Ok(Self(data.to_vec()))
     }
 
@@ -116,6 +115,17 @@ impl GitCommit {
 
     pub fn serialize(&self) -> Vec<u8> {
         self.0.clone()
+    }
+
+    pub fn tree(&self) -> anyhow::Result<GitSha1> {
+        let text =
+            std::str::from_utf8(&self.0).context("Unable to convert commit contents to string")?;
+        let tree_ref = text
+            .lines()
+            .find(|l| l.starts_with("tree "))
+            .map(|l| l.split(" ").skip(1).next().map(|s| s.trim()).unwrap())
+            .ok_or(anyhow!("Commit does not reference a tree"))?;
+        Ok(tree_ref.try_into()?)
     }
 }
 

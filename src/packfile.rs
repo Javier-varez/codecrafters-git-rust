@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, bail};
 
-use crate::gitsha1::GitSha1;
 use crate::object::{GitBlob, GitCommit, GitObject, GitTree};
 use crate::zlib;
 
@@ -262,7 +261,7 @@ fn parse_ofs_delta_object(obj_data: &[u8], base_obj_data: &[u8]) -> anyhow::Resu
     Ok(result)
 }
 
-pub fn parse(data: &[u8]) -> anyhow::Result<PackFile> {
+fn parse_header(data: &[u8]) -> anyhow::Result<(Header, &[u8])> {
     const HEADER_SIZE: usize = 12;
     // Check signature
     if data.len() < HEADER_SIZE {
@@ -275,14 +274,21 @@ pub fn parse(data: &[u8]) -> anyhow::Result<PackFile> {
 
     let version = u32::from_be_bytes(data[4..8].try_into()?);
     let num_objs = u32::from_be_bytes(data[8..12].try_into()?);
-    let header = Header { version, num_objs };
-    dbg!(&header);
+    Ok((Header { version, num_objs }, &data[HEADER_SIZE..]))
+}
+
+pub fn parse(data: &[u8]) -> anyhow::Result<PackFile> {
+    let (header, data) = parse_header(data)?;
+
+    if header.version != 2 {
+        bail!("Unsupported packfile version: {}", header.version);
+    }
 
     let mut object_map = HashMap::new();
     let mut objects = vec![];
-    let mut offset = HEADER_SIZE;
+    let mut offset = 0;
 
-    for _ in 0..num_objs {
+    for _ in 0..header.num_objs {
         if offset >= data.len() {
             bail!("Pack seems to be incomplete or malformated!");
         }
@@ -308,8 +314,6 @@ pub fn parse(data: &[u8]) -> anyhow::Result<PackFile> {
                     bail!("Decompressed size for object is not correct!");
                 }
 
-                println!("hash: {hash:?}, type: {ty:?}, decompressed_size {decompressed_size}");
-
                 object_map.insert(obj_offset, (hash, obj_data, ty));
                 objects.push(object);
             }
@@ -317,7 +321,7 @@ pub fn parse(data: &[u8]) -> anyhow::Result<PackFile> {
                 let (base_offset, consumed) = leb64(&data[offset..])?;
                 offset += consumed;
 
-                let Some((base_obj_hash, base_obj_data, base_obj_type)) =
+                let Some((_base_obj_hash, base_obj_data, base_obj_type)) =
                     object_map.get(&(obj_offset - base_offset))
                 else {
                     bail!("Unknown base object at offset {base_offset}");
@@ -335,7 +339,6 @@ pub fn parse(data: &[u8]) -> anyhow::Result<PackFile> {
 
                 let object = construct_git_object_from_raw_data(*base_obj_type, &obj_data)?;
                 let hash = object.hash();
-                println!("hash: {hash:?}, type: {ty:?}, base: {base_obj_hash:?}");
 
                 object_map.insert(obj_offset, (hash, obj_data, *base_obj_type));
                 objects.push(object);
@@ -352,30 +355,6 @@ pub fn parse(data: &[u8]) -> anyhow::Result<PackFile> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Decode variable int numbers.
-    #[inline]
-    pub fn otherLeb64(d: &[u8]) -> (u64, usize) {
-        let mut i = 0;
-        let mut c = d[i];
-        i += 1;
-        let mut value = c as u64 & 0x7f;
-        while c & 0x80 != 0 {
-            c = d[i];
-            i += 1;
-            debug_assert!(i <= 10, "Would overflow value at 11th iteration");
-            value += 1;
-            value = (value << 7) + (c as u64 & 0x7f)
-        }
-        (value, i)
-    }
-
-    #[test]
-    fn test_leb64() {
-        let input = [0xe5, 0x8e, 0x26];
-        assert_eq!(leb64(&input).unwrap().0 as u64, otherLeb64(&input).0);
-        assert_eq!(leb64(&input).unwrap().1, otherLeb64(&input).1);
-    }
 
     #[test]
     fn test_parse() {
